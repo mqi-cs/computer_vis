@@ -1,8 +1,8 @@
-"""Phase 1 — Landmark Extraction & Stage Instrumentation.
+"""Phase 1 & Phase 2 — Landmark Extraction, Stage Instrumentation & Features.
 
-Builds on Phase 0's capture loop. Adds MediaPipe HandLandmarker in
-LIVE_STREAM mode, a 21-point skeleton overlay, per-stage timing, and
-JSONL logging. No classification, no gesture logic, no keystrokes.
+Builds on Phase 1's capture & landmark loop. Adds MediaPipe HandLandmarker in
+LIVE_STREAM mode, a 21-point skeleton overlay, feature extraction (features.py),
+per-stage timing (including feature_ms), and JSONL logging.
 
 Usage:
     uv run landmarks.py [--camera INDEX] [--width W] [--height H] [--fps FPS]
@@ -23,6 +23,12 @@ from mediapipe.tasks.python.vision import (
     HandLandmarker,
     HandLandmarkerOptions,
     RunningMode,
+)
+
+from features import (
+    FEATURE_DIM,
+    compute_feature_stats,
+    extract_features,
 )
 
 
@@ -53,8 +59,6 @@ HAND_CONNECTIONS = [
 _slot_lock = threading.Lock()
 _slot = None  # (result, timestamp_ms, pipeline_ms) or None
 
-# Capture-time registry: timestamp_ms → monotonic capture time.
-# Written by main thread before detect_async, popped by callback.
 _capture_lock = threading.Lock()
 _capture_times = {}
 
@@ -83,7 +87,6 @@ def register_capture_time(timestamp_ms, capture_time):
     """Record when a frame was captured, keyed by its MediaPipe timestamp."""
     with _capture_lock:
         _capture_times[timestamp_ms] = capture_time
-        # Safety prune — should never accumulate under normal operation
         if len(_capture_times) > 120:
             for k in sorted(_capture_times)[:60]:
                 del _capture_times[k]
@@ -107,7 +110,7 @@ def monotonic_timestamp_ms():
 
 
 # ---------------------------------------------------------------------------
-# Helpers (carried from Phase 0)
+# Helpers
 # ---------------------------------------------------------------------------
 
 def percentile(buf, p):
@@ -123,7 +126,7 @@ def ms(seconds):
 
 
 # ---------------------------------------------------------------------------
-# Camera (carried from Phase 0)
+# Camera
 # ---------------------------------------------------------------------------
 
 SCAN_RANGE = 5
@@ -198,19 +201,32 @@ def draw_hand_skeleton(frame, hand_landmarks, w, h, mirror=False):
         cv2.circle(frame, (px, py), 4, (255, 0, 128), -1, cv2.LINE_AA)
 
 
-def draw_overlay(frame, intervals, read_times, detect_call_times,
-                 pipeline_times, actual_w, actual_h):
-    """Draw live timing stats on the top-left of the frame."""
+def draw_overlay(
+    frame,
+    intervals,
+    read_times,
+    detect_call_times,
+    feature_times,
+    pipeline_times,
+    actual_w,
+    actual_h,
+    feat_stats=None,
+    hand_present=False,
+):
+    """Draw live timing stats and feature vector summary on top-left of frame."""
     p50_int = ms(percentile(intervals, 50))
     p95_int = ms(percentile(intervals, 95))
     p50_read = ms(percentile(read_times, 50))
     p50_det = ms(percentile(detect_call_times, 50))
+    p50_feat = ms(percentile(feature_times, 50))
+    p95_feat = ms(percentile(feature_times, 95))
     equiv_fps = round(1000.0 / p50_int, 1) if p50_int > 0 else 0.0
 
     lines = [
         f"interval  p50 {p50_int:>6.1f} ms   p95 {p95_int:>6.1f} ms",
         f"read      p50 {p50_read:>6.1f} ms",
         f"detect    p50 {p50_det:>6.1f} ms",
+        f"feature   p50 {p50_feat:>6.1f} ms   p95 {p95_feat:>6.1f} ms",
     ]
 
     if pipeline_times:
@@ -221,13 +237,24 @@ def draw_overlay(frame, intervals, read_times, detect_call_times,
     lines.append(f"FPS (p50)     {equiv_fps:>6.1f}")
     lines.append(f"resolution    {actual_w}x{actual_h}")
 
+    if hand_present and feat_stats is not None:
+        lines.append(
+            f"feat norm {feat_stats['norm']:<4.2f} [min {feat_stats['min']:+.2f}, max {feat_stats['max']:+.2f}]"
+        )
+    else:
+        lines.append("feat [no hand detected]")
+
     y0 = 30
     for i, line in enumerate(lines):
-        y = y0 + i * 28
-        cv2.putText(frame, line, (11, y + 1),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
-        cv2.putText(frame, line, (10, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv2.LINE_AA)
+        y = y0 + i * 26
+        cv2.putText(
+            frame, line, (11, y + 1),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2, cv2.LINE_AA
+        )
+        cv2.putText(
+            frame, line, (10, y),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1, cv2.LINE_AA
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -236,17 +263,19 @@ def draw_overlay(frame, intervals, read_times, detect_call_times,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Phase 1 — Landmark Extraction & Stage Instrumentation")
+        description="Phase 1 & 2 — Landmarks, Stage Instrumentation & Features"
+    )
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--fps", type=int, default=30)
-    parser.add_argument("--model", default="hand_landmarker.task",
-                        help="Path to hand_landmarker.task model")
-    parser.add_argument("--log", default="timing.jsonl",
-                        help="JSONL timing log path")
-    parser.add_argument("--headless", action="store_true",
-                        help="Skip drawing and window display")
+    parser.add_argument(
+        "--model", default="hand_landmarker.task", help="Path to hand_landmarker.task model"
+    )
+    parser.add_argument("--log", default="timing.jsonl", help="JSONL timing log path")
+    parser.add_argument(
+        "--headless", action="store_true", help="Skip drawing and window display"
+    )
     args = parser.parse_args()
 
     requested = {"width": args.width, "height": args.height, "fps": args.fps}
@@ -275,13 +304,14 @@ def main():
         result_callback=_on_result,
     )
     landmarker = HandLandmarker.create_from_options(options)
-    print("✓ HandLandmarker loaded (LIVE_STREAM, num_hands=1)")
+    print(f"✓ HandLandmarker loaded (LIVE_STREAM, num_hands=1, dim={FEATURE_DIM})")
 
     # --- Rolling windows (~4 seconds) ---
     window_size = int((actual_fps if actual_fps > 0 else args.fps) * 4)
     intervals = collections.deque(maxlen=window_size)
     read_times = collections.deque(maxlen=window_size)
     detect_call_times = collections.deque(maxlen=window_size)
+    feature_times = collections.deque(maxlen=window_size)
     pipeline_times = collections.deque(maxlen=window_size)
 
     warmup_frames = 30
@@ -323,7 +353,7 @@ def main():
                 intervals.append(interval)
             prev_time = t_after_read
 
-            # -- Submit frame to MediaPipe (async, should not block) --
+            # -- Submit frame to MediaPipe (async, non-blocking) --
             ts_ms = monotonic_timestamp_ms()
             register_capture_time(ts_ms, t_after_read)
 
@@ -341,16 +371,34 @@ def main():
             hand_present = False
             pipeline_ms_val = None
             result = None
+            landmarks_arr = None
+            handedness_str = "Right"
 
             if slot is not None:
                 result, result_ts, p_ms = slot
-                hand_present = bool(result.hand_landmarks)
+                if result is not None and result.hand_landmarks:
+                    hand_present = True
+                    # Extract (21, 3) landmarks coordinates
+                    landmarks_arr = np.array(
+                        [[lm.x, lm.y, lm.z] for lm in result.hand_landmarks[0]],
+                        dtype=np.float32,
+                    )
+                    if result.handedness and result.handedness[0]:
+                        handedness_str = result.handedness[0][0].category_name
 
-                # Record pipeline latency only for new results
                 if result_ts != last_seen_ts and p_ms is not None:
-                    pipeline_times.append(p_ms / 1000)  # store as seconds
+                    pipeline_times.append(p_ms / 1000)
                     pipeline_ms_val = round(p_ms, 2)
                     last_seen_ts = result_ts
+
+            # -- Feature Extraction & Timing --
+            t_before_feat = time.monotonic()
+            feat_vec = extract_features(landmarks_arr, handedness=handedness_str)
+            t_after_feat = time.monotonic()
+
+            feat_duration = t_after_feat - t_before_feat
+            feature_times.append(feat_duration)
+            feat_stats = compute_feature_stats(feat_vec)
 
             # -- JSONL log --
             record = {
@@ -358,6 +406,7 @@ def main():
                 "interval_ms": round(interval * 1000, 2) if interval else None,
                 "read_ms": round(read_duration * 1000, 2),
                 "detect_call_ms": round(detect_call_duration * 1000, 2),
+                "feature_ms": round(feat_duration * 1000, 3),
                 "pipeline_ms": pipeline_ms_val,
                 "hand_present": hand_present,
             }
@@ -369,15 +418,25 @@ def main():
 
                 if hand_present and result is not None:
                     for hand_lms in result.hand_landmarks:
-                        draw_hand_skeleton(frame, hand_lms, actual_w, actual_h,
-                                           mirror=True)
+                        draw_hand_skeleton(
+                            frame, hand_lms, actual_w, actual_h, mirror=True
+                        )
 
                 if intervals:
-                    draw_overlay(frame, intervals, read_times,
-                                 detect_call_times, pipeline_times,
-                                 actual_w, actual_h)
+                    draw_overlay(
+                        frame,
+                        intervals,
+                        read_times,
+                        detect_call_times,
+                        feature_times,
+                        pipeline_times,
+                        actual_w,
+                        actual_h,
+                        feat_stats=feat_stats,
+                        hand_present=hand_present,
+                    )
 
-                cv2.imshow("Phase 1 — Landmarks", frame)
+                cv2.imshow("Phase 2 — Landmarks & Features", frame)
 
                 if cv2.waitKey(1) & 0xFF == 27:
                     break
@@ -404,6 +463,8 @@ def main():
         print(f"│  Interval    p99:    {ms(percentile(intervals, 99)):>7.1f} ms{'':<20}│")
         print(f"│  Read        p50:    {ms(percentile(read_times, 50)):>7.1f} ms{'':<20}│")
         print(f"│  Detect call p50:    {ms(percentile(detect_call_times, 50)):>7.1f} ms{'':<20}│")
+        print(f"│  Feature     p50:    {ms(percentile(feature_times, 50)):>7.2f} ms{'':<20}│")
+        print(f"│  Feature     p95:    {ms(percentile(feature_times, 95)):>7.2f} ms{'':<20}│")
         if pipeline_times:
             print(f"│  Pipeline    p50:    {ms(percentile(pipeline_times, 50)):>7.1f} ms{'':<20}│")
             print(f"│  Pipeline    p95:    {ms(percentile(pipeline_times, 95)):>7.1f} ms{'':<20}│")
