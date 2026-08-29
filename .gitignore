@@ -42,7 +42,11 @@ venv.bak/
 *.onnx
 *.pt
 *.pth
+*.task
 data/
 datasets/
 output/
 runs/
+
+# Timing logs
+*.jsonl
